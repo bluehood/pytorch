@@ -1,6 +1,7 @@
 #include <torch/csrc/distributed/rpc/functions.h>
 
 #include <torch/csrc/distributed/rpc/future_message.h>
+#include <torch/csrc/distributed/rpc/python_remote_call.h>
 #include <torch/csrc/distributed/rpc/python_rpc_handler.h>
 #include <torch/csrc/distributed/rpc/rref.h>
 #include <torch/csrc/distributed/rpc/rref_context.h>
@@ -61,15 +62,18 @@ Message processRequestBlocking(Message&& request) {
       }
       break;
     }
-    case MessageType::REMOTE_CALL: {
+    case MessageType::SCRIPT_REMOTE_CALL: {
       ScriptRemoteCall src = ScriptRemoteCall::fromMessage(request);
 
       auto rrefId = RRefId::fromIValue(src.retRRefId());
       auto forkId = ForkId::fromIValue(src.retForkId());
-      TORCH_CHECK(rrefId != forkId, "Does not support remote call to self.");
-
       auto& ctx = RRefContext::getInstance();
+
       auto ownerRRef = ctx->getOrCreateOwnerRRef<IValue>(rrefId);
+
+      if (forkId != rrefId) {
+        ctx->acceptUserRRef(rrefId, forkId, rrefId.createdOn_);
+      }
 
       // TODO: make this asynchronous
       // src is only alive within this block, use reference to avoid copy
@@ -83,9 +87,25 @@ Message processRequestBlocking(Message&& request) {
           stack.size());
 
       ownerRRef->setValue(std::move(stack.front()));
-      return Message();
+      break;
     }
-    case MessageType::RREF_FETCH_CALL: {
+    case MessageType::PYTHON_REMOTE_CALL: {
+      PythonRemoteCall prc = PythonRemoteCall::fromMessage(request);
+
+      auto rrefId = RRefId::fromIValue(prc.retRRefId());
+      auto forkId = ForkId::fromIValue(prc.retForkId());
+      auto& ctx = RRefContext::getInstance();
+
+      auto ownerRRef = ctx->getOrCreateOwnerRRef<py::object>(rrefId);
+
+      if (forkId != rrefId) {
+        ctx->acceptUserRRef(rrefId, forkId, rrefId.createdOn_);
+      }
+
+      ownerRRef->setValue(PythonRpcHandler::runPythonUDF(prc.udf()));
+      break;
+    }
+    case MessageType::SCRIPT_RREF_FETCH_CALL: {
       ScriptRRefFetchCall srf = ScriptRRefFetchCall::fromMessage(request);
       // TODO: make this asynchronous
       std::shared_ptr<OwnerRRef<IValue>> rref =
@@ -95,20 +115,44 @@ Message processRequestBlocking(Message&& request) {
       response.setId(request.id());
       return response;
     }
-    case MessageType::RREF_USER_CREATE: {
-      ScriptRRefCreate sra = ScriptRRefCreate::fromMessage(request);
-      RRefContext::getInstance()->addFork(sra.valueRef());
-      return Message();
+    case MessageType::PYTHON_RREF_FETCH_CALL: {
+      PythonRRefFetchCall srf = PythonRRefFetchCall::fromMessage(request);
+      // TODO: make this asynchronous
+      std::shared_ptr<OwnerRRef<py::object>> rref =
+          RRefContext::getInstance()->getOrCreateOwnerRRef<py::object>(
+              RRefId::fromIValue(srf.value()));
+      auto response =
+          ScriptRRefFetchRet(PythonRpcHandler::serialize(rref->getValue()))
+              .toMessage();
+      response.setId(request.id());
+      return response;
+    }
+    case MessageType::RREF_USER_ACCEPT: {
+      ScriptUserAccept sua = ScriptUserAccept::fromMessage(request);
+      RRefContext::getInstance()->finishUserRRef(sua.valueRef());
+      break;
     }
     case MessageType::RREF_USER_DELETE: {
-      ScriptRRefDelete srd = ScriptRRefDelete::fromMessage(request);
-      RRefContext::getInstance()->delFork(srd.valueRef());
-      return Message();
+      ScriptUserDelete srd = ScriptUserDelete::fromMessage(request);
+      RRefContext::getInstance()->delForkOfOwner(srd.valueRef());
+      break;
+    }
+    case MessageType::RREF_FORK_NOTIFY: {
+      ScriptForkNotify sfn = ScriptForkNotify::fromMessage(request);
+      RRefContext::getInstance()->acceptForkRequest(
+          sfn.valueRef(), sfn.forkDst());
+      break;
+    }
+    case MessageType::RREF_FORK_ACCEPT: {
+      ScriptForkAccept sfa = ScriptForkAccept::fromMessage(request);
+      RRefContext::getInstance()->finishForkRequest(sfa.valueRef());
+      break;
     }
     default: {
       AT_ERROR("Request type ", request.type(), " not supported.");
     }
   }
+  return Message();
 }
 
 } // namespace rpc
